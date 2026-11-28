@@ -7,7 +7,8 @@ import secrets
 import socket
 import subprocess
 import threading
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.parsers.expat import ExpatError
@@ -69,6 +70,125 @@ def gpu_percent():
     return None
 
 
+LOCAL_AI_PROCESS_NAMES = ("ollama", "llama-server", "llama.cpp", "lm studio", "lmstudio", "mlx_lm", "localai")
+
+
+def _int(value):
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0
+
+
+def ollama_status(base=None, timeout=1.5):
+    """Ollama version and loaded models, with the share of each model held in GPU memory."""
+    base = (base or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/version", timeout=timeout) as response:
+            version = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/api/ps", timeout=timeout) as response:
+            ps = json.loads(response.read())
+    except (OSError, ValueError) as exc:
+        audit("ollama.read", "error", {"type": type(exc).__name__})
+        return {"reachable": False, "version": None, "models": []}
+    models = []
+    listed = ps.get("models") if isinstance(ps, dict) else None
+    for model in listed if isinstance(listed, list) else []:
+        if not isinstance(model, dict):
+            continue
+        details = model.get("details") if isinstance(model.get("details"), dict) else {}
+        size, vram = _int(model.get("size")), _int(model.get("size_vram"))
+        models.append({
+            "name": str(model.get("name") or "unknown"), "size": size, "size_vram": vram,
+            "gpu_percent": round(min(100, 100 * vram / size), 1) if size and isinstance(model.get("size_vram"), (int, float)) and not isinstance(model.get("size_vram"), bool) and model["size_vram"] >= 0 else None,
+            "expires_at": model.get("expires_at") if isinstance(model.get("expires_at"), str) else None,
+            "parameter_size": details.get("parameter_size"), "quantization": details.get("quantization_level"),
+        })
+    version = version.get("version") if isinstance(version, dict) else None
+    return {"reachable": True, "version": version if isinstance(version, str) else None, "models": models}
+
+
+_TOKEN_LOGS = {}
+_TOKEN_LOGS_LOCK = threading.Lock()
+
+
+def _token_record(raw):
+    """(timestamp, location, tokens or None, model) for one invocation line, or None to skip it."""
+    try:
+        record = json.loads(raw.decode("utf-8"))
+        at = datetime.fromisoformat(str(record["timestamp"]).replace("Z", "+00:00"))
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(record, dict) or record.get("record_type") != "invocation":
+        return None
+    at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+    where = record.get("execution_location") if record.get("execution_location") in ("local", "remote") else "unknown"
+    tokens = record.get("total_tokens")
+    tokens = tokens if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0 else None
+    return at, where, tokens, record.get("model")
+
+
+def _token_log_checkpoint(log, offset, size=512):
+    """The first and last bytes already consumed, used to detect a log truncated in place and regrown."""
+    log.seek(0)
+    head = log.read(min(size, offset))
+    log.seek(max(0, offset - size))
+    return head, log.read(min(size, offset))
+
+
+def token_usage(path=None, hours=24, now=None):
+    """Local vs remote model invocations and tokens from the token-telemetry JSONL log, or None without a log.
+
+    The log is read incrementally: each call parses only the bytes appended since the previous call and keeps
+    the records still inside the window, so collection cost does not grow with the log's full history. A
+    replaced or truncated file (log rotation) is read again from the start.
+    """
+    path = Path(path or os.getenv("TOKEN_TELEMETRY_PATH", str(Path.home() / ".agents/data/token-telemetry/telemetry.jsonl"))).expanduser()
+    since = (now or datetime.now(timezone.utc)) - timedelta(hours=hours)
+    with _TOKEN_LOGS_LOCK:
+        try:
+            with path.open("rb") as log:
+                stat = os.fstat(log.fileno())
+                state = _TOKEN_LOGS.get(str(path))
+                if (state is None or state["inode"] != (stat.st_dev, stat.st_ino) or stat.st_size < state["offset"]
+                        or _token_log_checkpoint(log, state["offset"]) != state["checkpoint"]):
+                    state = {"inode": (stat.st_dev, stat.st_ino), "offset": 0, "records": [], "checkpoint": (b"", b"")}
+                log.seek(state["offset"])
+                for raw in log:
+                    record = _token_record(raw)
+                    if not raw.endswith(b"\n") and record is None:
+                        break  # a line still being written; read it on a later call
+                    state["offset"] += len(raw)
+                    if record and record[0] >= since:
+                        state["records"].append(record)
+                state["checkpoint"] = _token_log_checkpoint(log, state["offset"])
+        except OSError:
+            _TOKEN_LOGS.pop(str(path), None)
+            return None
+        state["records"] = [record for record in state["records"] if record[0] >= since]
+        _TOKEN_LOGS[str(path)] = state
+        records = list(state["records"])
+    totals = {key: {"invocations": 0, "tokens": 0, "unmeasured": 0} for key in ("local", "remote", "unknown")}
+    last_at, last_model = None, None
+    for at, where, tokens, model in records:
+        totals[where]["invocations"] += 1
+        if tokens is None:
+            totals[where]["unmeasured"] += 1
+        else:
+            totals[where]["tokens"] += tokens
+        if where == "local" and (last_at is None or at > last_at):
+            last_at, last_model = at, model
+    measured = totals["local"]["tokens"] + totals["remote"]["tokens"]
+    return {"window_hours": hours, **totals,
+            "local_share": round(100 * totals["local"]["tokens"] / measured, 1) if measured else None,
+            "last_local_at": last_at.isoformat() if last_at else None,
+            "last_local_model": last_model if isinstance(last_model, str) else None}
+
+
+def local_ai(applications):
+    """Local model runtimes: Ollama state, inference processes, and token-telemetry usage."""
+    processes = [app for app in applications if any(name in app["name"].lower() for name in LOCAL_AI_PROCESS_NAMES)]
+    processes.sort(key=lambda app: app["cpu_percent"], reverse=True)
+    return {"ollama": ollama_status(), "processes": processes[:8], "tokens": token_usage()}
+
+
 def collect():
     disks = []
     seen = set()
@@ -88,7 +208,7 @@ def collect():
             applications.append({"pid": info["pid"], "name": info["name"] or "unknown", "memory_bytes": info["memory_info"].rss if info["memory_info"] else 0, "cpu_percent": info["cpu_percent"] or 0})
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             pass
-    return {"host": socket.gethostname(), "sampled_at": datetime.now(timezone.utc).isoformat(), "cpu_percent": psutil.cpu_percent(interval=0.1), "gpu_percent": gpu_percent(), "memory": counter(psutil.virtual_memory()), "swap": counter(psutil.swap_memory()), "disks": disks, "disk_io": counter(psutil.disk_io_counters()), "network_io": counter(psutil.net_io_counters()), "applications": top_applications(applications), "battery": battery()}
+    return {"host": socket.gethostname(), "sampled_at": datetime.now(timezone.utc).isoformat(), "cpu_percent": psutil.cpu_percent(interval=0.1), "gpu_percent": gpu_percent(), "memory": counter(psutil.virtual_memory()), "swap": counter(psutil.swap_memory()), "disks": disks, "disk_io": counter(psutil.disk_io_counters()), "network_io": counter(psutil.net_io_counters()), "applications": top_applications(applications), "battery": battery(), "local_ai": local_ai(applications)}
 
 
 class Handler(BaseHTTPRequestHandler):

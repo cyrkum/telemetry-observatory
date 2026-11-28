@@ -37,6 +37,10 @@ def test_gpu_sample_is_validated_and_stored(monkeypatch, tmp_path):
     for invalid in (-1, 101):
         with pytest.raises(ValidationError):
             main.Sample(**data, gpu_percent=invalid)
+    ai = {'ollama': {'reachable': True, 'version': '0.40.19', 'models': []}, 'processes': [], 'tokens': None}
+    main.post_sample(main.Sample(**data, local_ai=ai), 'Bearer ' + 'a' * 32)
+    assert stored[-1]['local_ai'] == ai
+    assert stored[0]['local_ai'] is None
 
 
 def test_admin_rejects_invalid_token(monkeypatch, tmp_path):

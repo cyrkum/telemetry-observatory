@@ -27,11 +27,13 @@ def test_collect_skips_inaccessible_volume_and_process(monkeypatch):
     monkeypatch.setattr(host_sensor.psutil, 'net_io_counters', lambda: None)
     monkeypatch.setattr(host_sensor.psutil, 'sensors_battery', lambda: None)
     monkeypatch.setattr(host_sensor, 'gpu_percent', lambda: 37)
+    monkeypatch.setattr(host_sensor, 'local_ai', lambda apps: {'ollama': {'reachable': False, 'version': None, 'models': []}, 'processes': [], 'tokens': None})
     result = host_sensor.collect()
     assert result['disks'][0]['mount'] == '/'
     assert len(result['disks']) == 1
     assert result['applications'][0]['pid'] == 7
     assert result['gpu_percent'] == 37
+    assert result['local_ai']['ollama']['reachable'] is False
 
 
 @pytest.mark.parametrize('value', [0, 37, 100])
